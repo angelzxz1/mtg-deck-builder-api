@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: mtg-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - mtg-data:/app/data
+    environment:
+      # Modificaremos database.py internamente para apuntar a la carpeta /data
+      - DB_PATH=sqlite:////app/data/decks.db
+
+volumes:
+  mtg-data:
