@@ -9,6 +9,11 @@ from database import get_db, DeckModel
 app = FastAPI(title="MTG Smart Deck Builder API")
 
 
+@app.get("/")
+async def home_page():
+    return {"Message": "Hello My Friend!"}
+
+
 @app.post("/generate-deck", response_model=DeckResponse)
 async def generate_deck(request: DeckRequest, db: Session = Depends(get_db)):
     return build_advanced_deck_logic(request, db)
