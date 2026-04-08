@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine, Column, Integer, String, Float, Text, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-
+import os
 # URL de la base de datos (SQLite local)
 SQLALCHEMY_DATABASE_URL = os.getenv("DB_PATH", "sqlite:///./decks.db")
 
