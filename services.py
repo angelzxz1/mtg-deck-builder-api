@@ -37,9 +37,13 @@ class DeckBuilderService:
         self._build_lands_phase()
         response = self._construct_response()
 
+        # --- 🛡️ CORRECCIÓN: GUARDADO A PRUEBA DE FALLOS ---
         if self.db:
-            db_deck = self._save_to_db(response)
-            response.id = db_deck.id
+            try:
+                db_deck = self._save_to_db(response)
+                response.id = db_deck.id
+            except Exception as e:
+                print(f"⚠️ Error guardando en BD (ignorado): {e}")
 
         return response
 
@@ -93,61 +97,48 @@ class DeckBuilderService:
 
     def _build_spells_phase(self):
         target_spells = 99 - self.ratios["lands"]
-        premium_pool = [] # 🌟 LA IDEA DEL USUARIO: Guardar cartas caras por si sobra budget
+        premium_pool = [] 
         
-        # 1. Staples
+        # Staples y Cuotas (Igual que antes...)
         for c in ["Sol Ring", "Arcane Signet", "Commander's Sphere", "Mind Stone"]: self._add_single_card(c, "Ramp (Core)")
         for c in ["Lightning Greaves", "Swiftfoot Boots"]: self._add_single_card(c, "Protection")
         
-        # 2. Quotas
         self._fill_category_quota(self.ratios["ramp"], "Ramp", ["Mana Artifacts", "Ramp"])
         self._fill_category_quota(self.ratios["draw"], "Draw", ["Draw", "Card Draw"])
         self._fill_category_quota(self.ratios["removal"], "Removal", ["Removal", "Instants", "Sorceries"])
         
-        # 3. Synergy
+        # Sinergia
         synergy_cats = ["Instants", "Sorceries", "High Synergy"] if self.req.archetype == "Spellslinger" else ["High Synergy", "Creatures", "Planeswalkers", "Enchantments", "Top Cards"]
-            
+        
         candidates = []
         for cat in synergy_cats:
-            if cat in self.all_cards_map:
-                candidates.extend(self.all_cards_map[cat])
-                
+            if cat in self.all_cards_map: candidates.extend(self.all_cards_map[cat])
+
+        # Primer pase: Cartas que cumplen todo
         for c in candidates:
             if len(self.deck) >= target_spells: break
+            data = get_scryfall_data(c['name'])
+            if not data or "Land" in data["type_line"]: continue
             
-            name = c['name']
-            if name in self.seen_names: continue
-            
-            data = get_scryfall_data(name)
-            if not data or "Land" in parse_type_line(data["type_line"]): continue
-            
-            # Clasificación inteligente
             if data["price_usd"] <= self.req.max_single_card:
-                # Es barata, la intentamos meter normalmente
-                self._add_single_card(name, "Synergy")
+                self._add_single_card(c['name'], "Synergy")
             else:
-                # Es cara, la guardamos en la reserva (Límite 3x para evitar locuras de $50)
                 if data["price_usd"] <= (self.req.max_single_card * 3):
-                    premium_pool.append(name)
-                    
-        # 4. 🌟 FASE DE UPGRADE (Si faltan cartas y SOBRA budget)
+                    premium_pool.append(c['name'])
+
+        # Segundo pase: Gastar presupuesto sobrante (Upgrade)
         if len(self.deck) < target_spells:
-            # Ordenamos las caras de más barata a más cara para optimizar el dinero sobrante
-            premium_pool.sort(key=lambda n: get_scryfall_data(n)["price_usd"])
-            
+            premium_pool.sort(key=lambda n: get_scryfall_data(n).get("price_usd", 999))
             for name in premium_pool:
                 if len(self.deck) >= target_spells: break
-                # ignore_single_limit=True permite romper la regla de max_single_card
-                # PERO la función sigue bloqueando si se pasa del presupuesto TOTAL.
                 self._add_single_card(name, "Synergy (Upgrade)", ignore_single_limit=True)
 
-        # 5. 🚨 FASE DE EMERGENCIA FINAL (Si faltan cartas y NO hay budget)
+        # Tercer pase: Relleno de emergencia (Cualquier cosa barata para llegar a 99)
         if len(self.deck) < target_spells:
-            # Rellenamos con las cartas más baratas posibles (< $0.50)
-            cheap_fillers = [c['name'] for c in candidates if get_scryfall_data(c['name']) and get_scryfall_data(c['name'])["price_usd"] <= 0.50]
-            for name in cheap_fillers:
+            for c in candidates:
                 if len(self.deck) >= target_spells: break
-                self._add_single_card(name, "Synergy (Filler)", force_budget_bypass=True)
+                # Forzamos entrada ignorando budget para que el mazo NO sea corto
+                self._add_single_card(c['name'], "Synergy (Filler)", force_budget_bypass=True)
 
     def _fill_category_quota(self, quota: int, role_prefix: str, categories: list):
         needed = quota - \
@@ -185,37 +176,34 @@ class DeckBuilderService:
         self._fill_basic_lands(needed_lands)
 
     def _fill_basic_lands(self, total_land_slots: int):
-        # Calculamos cuántas tierras (de cualquier tipo) tenemos actualmente
         current_lands = sum(c.get("Quantity", 1) for c in self.deck if "Land" in c["Type"])
-        
         needed = total_land_slots - current_lands
         if needed <= 0: return
 
-        total_pips = sum(self.mana_pips.values()) or 1
         b_map = {'W': 'Plains', 'U': 'Island', 'B': 'Swamp', 'R': 'Mountain', 'G': 'Forest', 'C': 'Wastes'}
-        
-        for color, count in self.mana_pips.items():
-            if color in b_map:
-                num = round(needed * (count / total_pips))
-                if num > 0: self._add_basic_land_entry(b_map[color], num)
-        
-        current_lands_after = sum(c.get("Quantity", 1) for c in self.deck if "Land" in c["Type"])
-        missing = total_land_slots - current_lands_after
+        total_pips = sum(self.mana_pips.values())
+
+        if total_pips > 0:
+            # Reparto basado en símbolos encontrados
+            for color, count in self.mana_pips.items():
+                if color in b_map:
+                    num = int(needed * (count / total_pips)) # Usamos int para no pasarnos
+                    if num > 0: self._add_basic_land_entry(b_map[color], num)
+        else:
+            # --- 🛡️ PROTECCIÓN: Si no hay pips, repartir entre colores del comandante ---
+            colors = self.commander_colors if self.commander_colors else ['C']
+            share = needed // len(colors)
+            for color in colors:
+                if color in b_map: self._add_basic_land_entry(b_map[color], share)
+
+        # Ajuste final para llegar exactamente a 100 cartas
+        current_total = len(self.deck) + sum(c.get("Quantity", 1) - 1 for c in self.deck if "Quantity" in c)
+        missing = 99 - current_total
         
         if missing > 0:
-            # 🔧 NUEVA LÓGICA DE FALLBACK INTELIGENTE
-            if self.mana_pips:
-                # Si hay pips, usamos el color principal
-                main_color = self.mana_pips.most_common(1)[0][0]
-                fallback_land = b_map.get(main_color, "Island")
-            else:
-                # Si no hay pips, miramos los colores del comandante
-                if not self.commander_colors:
-                    fallback_land = "Wastes" # Comandante incoloro
-                else:
-                    fallback_land = b_map.get(self.commander_colors[0], "Island")
-                    
-            self._add_basic_land_entry(fallback_land, missing)
+            # Añadir el resto al color principal (o al primero del comandante)
+            main_color = self.mana_pips.most_common(1)[0][0] if total_pips > 0 else (self.commander_colors[0] if self.commander_colors else 'C')
+            self._add_basic_land_entry(b_map.get(main_color, "Island"), missing)
 
     def _add_basic_land_entry(self, name: str, qty: int):
         for c in self.deck:
@@ -250,9 +238,16 @@ class DeckBuilderService:
         return v_list, "".join([f"1 {c['Card Name']}\n" for c in f_list]), pd.DataFrame(f_list)[["Role", "Card Name", "Type", "Price (USD)", "Price (Local)"]]
 
     def _save_to_db(self, res: DeckResponse):
+        # --- 🛡️ CORRECCIÓN: USAR model_dump() PARA PYDANTIC V2 ---
         db_deck = DeckModel(
-            commander=res.commander, archetype=res.archetype_used, budget=res.final_budget_usd, currency=res.currency,
-            deck_list=[c.dict() for c in res.deck_list], analytics=res.analytics.dict(), export_text=res.export_text, excel_base64=res.excel_base64
+            commander=res.commander, 
+            archetype=res.archetype_used, 
+            budget=res.final_budget_usd, 
+            currency=res.currency,
+            deck_list=[c.model_dump() for c in res.deck_list], 
+            analytics=res.analytics.model_dump(), 
+            export_text=res.export_text, 
+            excel_base64=res.excel_base64
         )
         self.db.add(db_deck)
         self.db.commit()
