@@ -92,28 +92,40 @@ class DeckBuilderService:
         return True
 
     def _build_spells_phase(self):
-        for c in ["Sol Ring", "Arcane Signet", "Commander's Sphere", "Mind Stone"]:
-            self._add_single_card(c, "Ramp (Core)")
-        for c in ["Lightning Greaves", "Swiftfoot Boots"]:
-            self._add_single_card(c, "Protection")
-
-        self._fill_category_quota(self.ratios["ramp"], "Ramp", [
-                                  "Mana Artifacts", "Ramp"])
-        self._fill_category_quota(
-            self.ratios["draw"], "Draw", ["Draw", "Card Draw"])
-        self._fill_category_quota(self.ratios["removal"], "Removal", [
-                                  "Removal", "Instants", "Sorceries"])
-
         target_spells = 99 - self.ratios["lands"]
-        synergy_cats = ["Instants", "Sorceries", "High Synergy"] if self.req.archetype == "Spellslinger" else [
-            "High Synergy", "Creatures", "Planeswalkers", "Enchantments", "Top Cards"]
-
+        
+        # 1. Staples
+        for c in ["Sol Ring", "Arcane Signet", "Commander's Sphere", "Mind Stone"]: self._add_single_card(c, "Ramp (Core)")
+        for c in ["Lightning Greaves", "Swiftfoot Boots"]: self._add_single_card(c, "Protection")
+        
+        # 2. Quotas
+        self._fill_category_quota(self.ratios["ramp"], "Ramp", ["Mana Artifacts", "Ramp"])
+        self._fill_category_quota(self.ratios["draw"], "Draw", ["Draw", "Card Draw"])
+        self._fill_category_quota(self.ratios["removal"], "Removal", ["Removal", "Instants", "Sorceries"])
+        
+        # 3. Synergy
+        synergy_cats = ["Instants", "Sorceries", "High Synergy"] if self.req.archetype == "Spellslinger" else ["High Synergy", "Creatures", "Planeswalkers", "Enchantments", "Top Cards"]
+            
         for cat in synergy_cats:
             if cat in self.all_cards_map:
                 for c in self.all_cards_map[cat]:
-                    if len(self.deck) >= target_spells:
-                        return
+                    if len(self.deck) >= target_spells: return
                     self._add_single_card(c['name'], "Synergy")
+                    
+        # --- 🚨 NUEVO: FASE DE EMERGENCIA (DESPERATION PASS) ---
+        # Si el presupuesto cortó muchas cartas y NO llegamos a los 63 hechizos:
+        if len(self.deck) < target_spells:
+            print(f"⚠️ Presupuesto estricto: Faltan hechizos. Rellenando espacios...")
+            candidates = []
+            for cat_list in self.all_cards_map.values():
+                candidates.extend(cat_list)
+                
+            for c in candidates:
+                if len(self.deck) >= target_spells: break
+                if "Basic Land" in c.get("type_line", ""): continue
+                # Usamos force_free=True para saltarnos el bloqueo del presupuesto
+                # y garantizar que el mazo tenga los hechizos necesarios para jugar.
+                self._add_single_card(c['name'], "Synergy (Filler)", force_free=True)
 
     def _fill_category_quota(self, quota: int, role_prefix: str, categories: list):
         needed = quota - \
@@ -151,24 +163,37 @@ class DeckBuilderService:
         self._fill_basic_lands(needed_lands)
 
     def _fill_basic_lands(self, total_land_slots: int):
-        needed = total_land_slots - \
-            len([x for x in self.deck if "Land" in x["Type"]])
-        if needed <= 0:
-            return
+        # Calculamos cuántas tierras (de cualquier tipo) tenemos actualmente
+        current_lands = sum(c.get("Quantity", 1) for c in self.deck if "Land" in c["Type"])
+        
+        needed = total_land_slots - current_lands
+        if needed <= 0: return
+
         total_pips = sum(self.mana_pips.values()) or 1
-        b_map = {'W': 'Plains', 'U': 'Island',
-                 'B': 'Swamp', 'R': 'Mountain', 'G': 'Forest'}
+        b_map = {'W': 'Plains', 'U': 'Island', 'B': 'Swamp', 'R': 'Mountain', 'G': 'Forest', 'C': 'Wastes'}
+        
         for color, count in self.mana_pips.items():
             if color in b_map:
                 num = round(needed * (count / total_pips))
-                if num > 0:
-                    self._add_basic_land_entry(b_map[color], num)
-
-        missing = 99 - (len(self.deck) + sum(c.get("Quantity",
-                        1) - 1 for c in self.deck if "Quantity" in c))
+                if num > 0: self._add_basic_land_entry(b_map[color], num)
+        
+        current_lands_after = sum(c.get("Quantity", 1) for c in self.deck if "Land" in c["Type"])
+        missing = total_land_slots - current_lands_after
+        
         if missing > 0:
-            self._add_basic_land_entry(b_map[self.mana_pips.most_common(
-                1)[0][0]] if self.mana_pips else "Mountain", missing)
+            # 🔧 NUEVA LÓGICA DE FALLBACK INTELIGENTE
+            if self.mana_pips:
+                # Si hay pips, usamos el color principal
+                main_color = self.mana_pips.most_common(1)[0][0]
+                fallback_land = b_map.get(main_color, "Island")
+            else:
+                # Si no hay pips, miramos los colores del comandante
+                if not self.commander_colors:
+                    fallback_land = "Wastes" # Comandante incoloro
+                else:
+                    fallback_land = b_map.get(self.commander_colors[0], "Island")
+                    
+            self._add_basic_land_entry(fallback_land, missing)
 
     def _add_basic_land_entry(self, name: str, qty: int):
         for c in self.deck:

@@ -50,11 +50,11 @@ def get_scryfall_data(card_name):
 
 
 def count_mana_pips(mana_cost_str):
-    if not mana_cost_str:
-        return Counter()
+    if not mana_cost_str: return Counter()
     clean = re.sub(r'\{\d+\}', '', mana_cost_str).replace('{X}', '')
     cnt = Counter()
-    for color in ['W', 'U', 'B', 'R', 'G']:
+    # 🔧 Agregamos la 'C' al final de la lista
+    for color in ['W', 'U', 'B', 'R', 'G', 'C']:
         cnt[color] += clean.count(f'{{{color}}}')
     return cnt
 
