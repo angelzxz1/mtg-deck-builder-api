@@ -53,35 +53,35 @@ class DeckBuilderService:
         cmd_data = get_scryfall_data(self.req.commander_name)
         self.commander_colors = cmd_data.get("colors", []) if cmd_data else []
 
-    def _add_single_card(self, name: str, role: str, is_land_slot: bool = False, force_free: bool = False) -> bool:
-        if name in self.seen_names:
-            return False
+    def _add_single_card(self, name: str, role: str, is_land_slot: bool = False, force_budget_bypass: bool = False, ignore_single_limit: bool = False) -> bool:
+        if name in self.seen_names: return False
         data = get_scryfall_data(name)
-        if not data:
-            return False
+        if not data: return False
 
         type_line = parse_type_line(data["type_line"])
-        is_actual_land = "Land" in type_line and "Double Faced" not in data.get(
-            "type_line", "")
-        if not is_land_slot and is_actual_land:
-            return False
+        is_actual_land = "Land" in type_line and "Double Faced" not in data.get("type_line", "")
+        if not is_land_slot and is_actual_land: return False
 
         real_price = data["price_usd"]
         is_owned = name.lower() in self.owned_set
-        effective_price = 0.0 if (is_owned or force_free) else real_price
+        
+        actual_cost_to_add = 0.0 if is_owned else real_price
 
-        if not is_owned and not force_free and real_price > self.req.max_single_card:
-            return False
-        if not is_land_slot and (self.current_cost + effective_price > self.req.budget):
-            return False
+        # Filtros Inteligentes
+        if not is_owned:
+            # 1. Filtro de precio individual (se puede ignorar en Fase Upgrade)
+            if not ignore_single_limit and real_price > self.req.max_single_card: 
+                return False
+            # 2. Filtro de presupuesto total (se puede ignorar en Fase Emergencia)
+            if not is_land_slot and not force_budget_bypass:
+                if self.current_cost + actual_cost_to_add > self.req.budget: 
+                    return False
 
-        self.current_cost += effective_price
+        self.current_cost += actual_cost_to_add
         self.seen_names.add(name)
-
-        if not is_actual_land:
-            self.cmc_curve[str(int(data["cmc"]))] += 1
-        for c in data["colors"]:
-            self.color_dist[c] += 1
+        
+        if not is_actual_land: self.cmc_curve[str(int(data["cmc"]))] += 1
+        for c in data["colors"]: self.color_dist[c] += 1
         self.mana_pips.update(count_mana_pips(data["mana_cost"]))
 
         self.deck.append({
@@ -93,6 +93,7 @@ class DeckBuilderService:
 
     def _build_spells_phase(self):
         target_spells = 99 - self.ratios["lands"]
+        premium_pool = [] # 🌟 LA IDEA DEL USUARIO: Guardar cartas caras por si sobra budget
         
         # 1. Staples
         for c in ["Sol Ring", "Arcane Signet", "Commander's Sphere", "Mind Stone"]: self._add_single_card(c, "Ramp (Core)")
@@ -106,26 +107,47 @@ class DeckBuilderService:
         # 3. Synergy
         synergy_cats = ["Instants", "Sorceries", "High Synergy"] if self.req.archetype == "Spellslinger" else ["High Synergy", "Creatures", "Planeswalkers", "Enchantments", "Top Cards"]
             
+        candidates = []
         for cat in synergy_cats:
             if cat in self.all_cards_map:
-                for c in self.all_cards_map[cat]:
-                    if len(self.deck) >= target_spells: return
-                    self._add_single_card(c['name'], "Synergy")
-                    
-        # --- 🚨 NUEVO: FASE DE EMERGENCIA (DESPERATION PASS) ---
-        # Si el presupuesto cortó muchas cartas y NO llegamos a los 63 hechizos:
-        if len(self.deck) < target_spells:
-            print(f"⚠️ Presupuesto estricto: Faltan hechizos. Rellenando espacios...")
-            candidates = []
-            for cat_list in self.all_cards_map.values():
-                candidates.extend(cat_list)
+                candidates.extend(self.all_cards_map[cat])
                 
-            for c in candidates:
+        for c in candidates:
+            if len(self.deck) >= target_spells: break
+            
+            name = c['name']
+            if name in self.seen_names: continue
+            
+            data = get_scryfall_data(name)
+            if not data or "Land" in parse_type_line(data["type_line"]): continue
+            
+            # Clasificación inteligente
+            if data["price_usd"] <= self.req.max_single_card:
+                # Es barata, la intentamos meter normalmente
+                self._add_single_card(name, "Synergy")
+            else:
+                # Es cara, la guardamos en la reserva (Límite 3x para evitar locuras de $50)
+                if data["price_usd"] <= (self.req.max_single_card * 3):
+                    premium_pool.append(name)
+                    
+        # 4. 🌟 FASE DE UPGRADE (Si faltan cartas y SOBRA budget)
+        if len(self.deck) < target_spells:
+            # Ordenamos las caras de más barata a más cara para optimizar el dinero sobrante
+            premium_pool.sort(key=lambda n: get_scryfall_data(n)["price_usd"])
+            
+            for name in premium_pool:
                 if len(self.deck) >= target_spells: break
-                if "Basic Land" in c.get("type_line", ""): continue
-                # Usamos force_free=True para saltarnos el bloqueo del presupuesto
-                # y garantizar que el mazo tenga los hechizos necesarios para jugar.
-                self._add_single_card(c['name'], "Synergy (Filler)", force_free=True)
+                # ignore_single_limit=True permite romper la regla de max_single_card
+                # PERO la función sigue bloqueando si se pasa del presupuesto TOTAL.
+                self._add_single_card(name, "Synergy (Upgrade)", ignore_single_limit=True)
+
+        # 5. 🚨 FASE DE EMERGENCIA FINAL (Si faltan cartas y NO hay budget)
+        if len(self.deck) < target_spells:
+            # Rellenamos con las cartas más baratas posibles (< $0.50)
+            cheap_fillers = [c['name'] for c in candidates if get_scryfall_data(c['name']) and get_scryfall_data(c['name'])["price_usd"] <= 0.50]
+            for name in cheap_fillers:
+                if len(self.deck) >= target_spells: break
+                self._add_single_card(name, "Synergy (Filler)", force_budget_bypass=True)
 
     def _fill_category_quota(self, quota: int, role_prefix: str, categories: list):
         needed = quota - \
