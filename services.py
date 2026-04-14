@@ -97,48 +97,48 @@ class DeckBuilderService:
 
     def _build_spells_phase(self):
         target_spells = 99 - self.ratios["lands"]
-        premium_pool = [] 
         
-        # Staples y Cuotas (Igual que antes...)
+        # 1. Staples
         for c in ["Sol Ring", "Arcane Signet", "Commander's Sphere", "Mind Stone"]: self._add_single_card(c, "Ramp (Core)")
         for c in ["Lightning Greaves", "Swiftfoot Boots"]: self._add_single_card(c, "Protection")
         
-        self._fill_category_quota(self.ratios["ramp"], "Ramp", ["Mana Artifacts", "Ramp"])
-        self._fill_category_quota(self.ratios["draw"], "Draw", ["Draw", "Card Draw"])
-        self._fill_category_quota(self.ratios["removal"], "Removal", ["Removal", "Instants", "Sorceries"])
-        
-        # Sinergia
-        synergy_cats = ["Instants", "Sorceries", "High Synergy"] if self.req.archetype == "Spellslinger" else ["High Synergy", "Creatures", "Planeswalkers", "Enchantments", "Top Cards"]
-        
-        candidates = []
-        for cat in synergy_cats:
-            if cat in self.all_cards_map: candidates.extend(self.all_cards_map[cat])
+        # 2. Obtener TODAS las cartas de EDHRec en un solo array grande
+        all_candidates = []
+        for cat_list in self.all_cards_map.values():
+            for card in cat_list:
+                if card['name'] not in [c['name'] for c in all_candidates]:
+                    all_candidates.append(card)
 
-        # Primer pase: Cartas que cumplen todo
-        for c in candidates:
+        # 3. Primer Pase: Solo cartas que cumplan el límite de precio
+        for c in all_candidates:
             if len(self.deck) >= target_spells: break
             data = get_scryfall_data(c['name'])
             if not data or "Land" in data["type_line"]: continue
             
             if data["price_usd"] <= self.req.max_single_card:
                 self._add_single_card(c['name'], "Synergy")
-            else:
-                if data["price_usd"] <= (self.req.max_single_card * 3):
-                    premium_pool.append(c['name'])
 
-        # Segundo pase: Gastar presupuesto sobrante (Upgrade)
+        # 4. Segundo Pase: Si faltan cartas y SOBRA presupuesto (Upgrade)
         if len(self.deck) < target_spells:
-            premium_pool.sort(key=lambda n: get_scryfall_data(n).get("price_usd", 999))
-            for name in premium_pool:
+            # Ordenar las cartas que descartamos de más baratas a más caras
+            premium_candidates = [
+                c['name'] for c in all_candidates 
+                if get_scryfall_data(c['name']) and get_scryfall_data(c['name'])["price_usd"] > self.req.max_single_card
+            ]
+            premium_candidates.sort(key=lambda n: get_scryfall_data(n)["price_usd"])
+
+            for name in premium_candidates:
                 if len(self.deck) >= target_spells: break
                 self._add_single_card(name, "Synergy (Upgrade)", ignore_single_limit=True)
 
-        # Tercer pase: Relleno de emergencia (Cualquier cosa barata para llegar a 99)
+        # 5. TERCER PASE (ESTRICTO): Forzar el relleno hasta 63
+        # Si el presupuesto se acabó, ignoramos el dinero para garantizar un mazo de 100 cartas
         if len(self.deck) < target_spells:
-            for c in candidates:
+            for c in all_candidates:
                 if len(self.deck) >= target_spells: break
-                # Forzamos entrada ignorando budget para que el mazo NO sea corto
-                self._add_single_card(c['name'], "Synergy (Filler)", force_budget_bypass=True)
+                data = get_scryfall_data(c['name'])
+                if data and "Land" not in data["type_line"]:
+                    self._add_single_card(c['name'], "Synergy (Filler)", force_budget_bypass=True, ignore_single_limit=True)
 
     def _fill_category_quota(self, quota: int, role_prefix: str, categories: list):
         needed = quota - \
@@ -176,34 +176,36 @@ class DeckBuilderService:
         self._fill_basic_lands(needed_lands)
 
     def _fill_basic_lands(self, total_land_slots: int):
+        # ¿Cuántas tierras (duales, especiales, etc.) ya pusimos?
         current_lands = sum(c.get("Quantity", 1) for c in self.deck if "Land" in c["Type"])
+        
+        # ¿Cuántas básicas faltan para llegar EXACTAMENTE a las 36 tierras?
         needed = total_land_slots - current_lands
         if needed <= 0: return
 
         b_map = {'W': 'Plains', 'U': 'Island', 'B': 'Swamp', 'R': 'Mountain', 'G': 'Forest', 'C': 'Wastes'}
         total_pips = sum(self.mana_pips.values())
 
+        # 1. Reparto matemático
         if total_pips > 0:
-            # Reparto basado en símbolos encontrados
             for color, count in self.mana_pips.items():
                 if color in b_map:
-                    num = int(needed * (count / total_pips)) # Usamos int para no pasarnos
+                    num = int(needed * (count / total_pips))
                     if num > 0: self._add_basic_land_entry(b_map[color], num)
         else:
-            # --- 🛡️ PROTECCIÓN: Si no hay pips, repartir entre colores del comandante ---
+            # Si no hay hechizos con color, repartimos equitativamente según el comandante
             colors = self.commander_colors if self.commander_colors else ['C']
             share = needed // len(colors)
             for color in colors:
                 if color in b_map: self._add_basic_land_entry(b_map[color], share)
 
-        # Ajuste final para llegar exactamente a 100 cartas
-        current_total = len(self.deck) + sum(c.get("Quantity", 1) - 1 for c in self.deck if "Quantity" in c)
-        missing = 99 - current_total
+        # 2. Ajuste Final ESTRICTO para Tierras (Solo cuenta las tierras, no los hechizos)
+        current_lands_after = sum(c.get("Quantity", 1) for c in self.deck if "Land" in c["Type"])
+        missing_lands = total_land_slots - current_lands_after
         
-        if missing > 0:
-            # Añadir el resto al color principal (o al primero del comandante)
+        if missing_lands > 0:
             main_color = self.mana_pips.most_common(1)[0][0] if total_pips > 0 else (self.commander_colors[0] if self.commander_colors else 'C')
-            self._add_basic_land_entry(b_map.get(main_color, "Island"), missing)
+            self._add_basic_land_entry(b_map.get(main_color, "Island"), missing_lands)
 
     def _add_basic_land_entry(self, name: str, qty: int):
         for c in self.deck:
